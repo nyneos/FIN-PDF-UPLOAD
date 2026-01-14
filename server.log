@@ -1,1 +1,0 @@
-2026-01-15 01:05:13,472 | INFO | bank_parser | slowapi detected. Not enabling middleware automatically; using local limiter by default.
