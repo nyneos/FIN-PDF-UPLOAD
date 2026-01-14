@@ -9,6 +9,7 @@ numpy
 requests
 pillow
 python-multipart
+python-docx
 slowapi
 limits
 python-dotenv
