@@ -77,12 +77,6 @@ curl -X POST http://localhost:8000/parse/stream \
 User Upload → Validation → Extraction → Chunking → LLM → Deduplication → Stream
 ```
 
-## Performance
-
-- **22-page ICICI PDF**: 195s latency, 25 transactions, 5 LLM calls
-- **6-page Citi PDF**: 41s latency, 18 transactions, 2 LLM calls
-- **DOCX Statement**: 56 transactions extracted
-
 ## Deployment
 
 **Render.com** (recommended)
