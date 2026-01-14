@@ -1,0 +1,130 @@
+[
+  {
+    "suggestion": "Please provide the transactions data to validate and process.",
+    "reason": "The transactions array is empty. Without transaction records, balance validation, date/amount normalization, and deduplication cannot be performed."
+  },
+  {
+    "suggestion": "Add transactions for the period 01-05-2020 to 31-07-2020 to validate the balance progression from ₹31,003.24 to ₹38,492.24",
+    "reason": "The account shows a non-zero balance change over 3 months but contains no transaction records. This is inconsistent - a valid account statement must have transactions to explain balance changes between the stated opening and closing balances."
+  },
+  {
+    "suggestion": "The provided transactions seem to be accurate. However, it is suggested to verify the transactions for any potential errors or discrepancies.",
+    "reason": "The calculated closing balance matches the provided closing balance."
+  },
+  {
+    "suggestion": "Mark duplicate transactions and maintain consistent transaction dates.",
+    "reason": "There are duplicate transactions (e.g., two transactions with amount 50000.0 to account 4897692162094). Also, all transactions seem to have the same date, which might be incorrect."
+  },
+  {
+    "suggestion": "Some transactions have similar descriptions and amounts, which might indicate duplicates. Please review the transactions to ensure accuracy.",
+    "reason": "Potential duplicate transactions detected"
+  },
+  {
+    "suggestion": "The transaction on 09/01 with description 'Mobile Deposit' appears to be a duplicate, consider removing one instance.",
+    "reason": "Potential duplicate transaction found"
+  },
+  {
+    "suggestion": "",
+    "reason": ""
+  },
+  {
+    "suggestion": null,
+    "reason": "No issues found with the provided transaction."
+  },
+  {
+    "suggestion": "Consider providing opening and closing balances for comprehensive validation.",
+    "reason": "Incomplete data for thorough validation."
+  },
+  {
+    "suggestion": "Metadata Opening and Closing balances are matching with calculated balances",
+    "reason": "Balances are tallying hence no fixes are suggested."
+  },
+  {
+    "suggestion": "Verify the Mobile Deposit transactions on 2023-09-28 as they seem to be duplicated.",
+    "reason": "Potential duplicate transactions which could affect the account balance accuracy."
+  },
+  {
+    "suggestion": "All transactions appear to be correctly parsed and ordered chronologically. No major discrepancies were found in the balance calculations.",
+    "reason": "The transactions were processed in the order provided, and balances were calculated based on deposits and withdrawals. No evidence of duplicates or significant anomalies was detected."
+  },
+  {
+    "suggestion": "The provided transactions seem to be correct and in order. However, there are a few minor discrepancies noted between calculated and provided balances at certain points.",
+    "reason": "As the calculated and provided closing balance matches (116149.46) with initial and continuous calculations verified, no data seems missing or wrongly stated."
+  },
+  {
+    "suggestion": null,
+    "reason": "No transactions provided for validation."
+  },
+  {
+    "suggestion": "Please provide transactions for the period between 2022-06-01 and 2022-12-12.",
+    "reason": "No transactions were provided for validation and processing."
+  },
+  {
+    "suggestion": "Please provide transaction data for validation.",
+    "reason": "No transactions provided for processing."
+  },
+  {
+    "suggestion": "Please verify and provide transaction data for the specified period.",
+    "reason": "The transaction list is empty. Validation, deduplication, normalization, and balance verification cannot be performed without transaction data."
+  },
+  {
+    "suggestion": "No transactions provided for validation.",
+    "reason": "The list of transactions is empty."
+  },
+  {
+    "suggestion": "No transactions provided for validation.",
+    "reason": "The transactions list is empty."
+  },
+  {
+    "suggestion": "No transactions provided for validation.",
+    "reason": "The list of transactions is empty."
+  },
+  {
+    "suggestion": "No changes needed.",
+    "reason": "The transaction appears to be correctly formatted and balanced. Additional context (like opening/closing balances) is required for deeper validation."
+  },
+  {
+    "suggestion": null,
+    "reason": "No discrepancies or suggestions found. Transaction appears valid."
+  },
+  {
+    "suggestion": "Please provide metadata and transactions for validation.",
+    "reason": "No data provided for validation."
+  },
+  {
+    "suggestion": "The running balances seem accurate. No significant discrepancies found.",
+    "reason": "The transactions appear to be correctly ordered and the running balances match the stated closing balance."
+  },
+  {
+    "suggestion": "No issues found.",
+    "reason": "The transactions and running balances appear to be accurate."
+  },
+  {
+    "suggestion": "The duplicate transactions on 2023-08-04 and similar transactions should be reviewed and confirmed for accuracy.",
+    "reason": "Duplicate transactions with similar narrations and amounts were found."
+  },
+  {
+    "suggestion": "The transactions have been validated and corrected for duplicates, date and amount normalization.",
+    "reason": "The transactions were processed to ensure running balances were accurate and consistent."
+  },
+  {
+    "suggestion": "Some transactions have similar narration and amounts, possibly duplicates. Consider removing or merging duplicates.",
+    "reason": "Duplicate transactions detected with similar narration and amounts."
+  },
+  {
+    "suggestion": "Review transactions for duplicates and discrepancies in running balances.",
+    "reason": "The calculated closing balance does not match the provided closing balance. Some transactions appear to be near-duplicates."
+  },
+  {
+    "suggestion": "The duplicate transactions on 2013-10-07 and some other transactions have incorrect running balances. The corrected transactions are provided.",
+    "reason": "Duplicate transactions and incorrect running balances were detected. The transactions were deduplicated, and the running balances were corrected."
+  },
+  {
+    "suggestion": null,
+    "reason": "No discrepancies found in the transactions."
+  },
+  {
+    "suggestion": "Some transactions had incorrect running balances. Please review and update the transactions.",
+    "reason": "Discrepancies in running balances were found."
+  }
+]

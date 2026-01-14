@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: bank-statement-parser
+    runtime: python-3.11
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port 8000"
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+      - key: OCR_MAX_PAGES
+        value: "200"
+      - key: AI_RETRY_COUNT
+        value: "1"
+      - key: MAX_PDF_SIZE_MB
+        value: "50"
+      - key: AI_TIMEOUT_SECONDS
+        value: "30"
+    autoDeploy: true

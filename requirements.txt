@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pymupdf
+pdfplumber
+pytesseract
+pdf2image
+opencv-python-headless
+numpy
+requests
+pillow
+python-multipart
+slowapi
+limits
+python-dotenv
