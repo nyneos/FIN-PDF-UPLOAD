@@ -19,10 +19,15 @@ def _parse_date_to_iso(s):
         except Exception:
             pass
 
-    # Try to extract a date-like substring
+    # Try to extract a date-like substring (avoid infinite recursion)
     m = re.search(r"(\d{4}-\d{2}-\d{2}|\d{2}[\-/]\d{2}[\-/]\d{2,4})", s)
     if m:
-        return _parse_date_to_iso(m.group(0))
+        extracted = m.group(0)
+        # Prevent infinite recursion: only recurse if extracted differs from input
+        if extracted != s:
+            return _parse_date_to_iso(extracted)
+        # If extracted equals input, we already tried parsing it above, so return None
+        return None
 
     return None
 

@@ -1,8 +1,8 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 import time
-from fastapi import Request
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import json
@@ -12,10 +12,15 @@ from config import config
 from logging_config import configure_logging
 from utils.file_validator import validate_pdf_file
 from utils.common import generate_request_id
+from utils.token_tracker import get_usage_stats, record_tokens, reset_tracker
+from utils.log_streamer import get_streaming_handler, log_stream_generator
 import re
 
 
 logger = configure_logging(config.LOG_LEVEL)
+
+# Note: Log streaming handler is lazy-initialized on first /api/logs/stream request
+# to avoid conflicts with uvicorn's logging setup at import time
 
 
 app = FastAPI(
@@ -43,7 +48,7 @@ if config.RATE_LIMIT_ENABLED:
         logger.debug("rate limit check initialization skipped; using local limiter")
 
 
-# Simple permissive CORS for development; restrict in production
+# CORS: Allow all origins (no authentication required)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,6 +61,95 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/tokens/check")
+def check_token_usage():
+    """
+    Check current token usage and eligibility for AI calls.
+    
+    Returns:
+        - Current usage (today, this month, this hour)
+        - Remaining capacity
+        - Eligibility status for making new AI requests
+        - Warnings if approaching limits
+    
+    Use this endpoint BEFORE calling /parse to determine if you have sufficient quota.
+    """
+    try:
+        # Get Groq rate limits from config (or use defaults)
+        tpm_limit = getattr(config, "GROQ_TPM_LIMIT", 30000) or 30000  # 30k TPM for free tier
+        tokens_per_month = 14_400_000  # 14.4M tokens/month for Groq free tier
+        
+        stats = get_usage_stats(tpm_limit=tpm_limit, tokens_per_month=tokens_per_month)
+        
+        return {
+            "success": True,
+            "data": stats,
+        }
+    except Exception as e:
+        logger.exception(f"[TOKEN_CHECK] Error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)},
+        )
+
+
+@app.post("/api/tokens/reset")
+def reset_token_tracker_endpoint():
+    """
+    Reset token usage tracker (admin/testing only).
+    
+    WARNING: This will clear all usage history. Use only for testing or manual resets.
+    """
+    try:
+        reset_tracker()
+        return {
+            "success": True,
+            "message": "Token tracker reset successfully",
+        }
+    except Exception as e:
+        logger.exception(f"[TOKEN_RESET] Error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)},
+        )
+
+
+@app.get("/api/logs/stream")
+async def stream_logs():
+    """
+    Real-time log streaming endpoint using Server-Sent Events (SSE).
+    
+    ⚠️ TEMPORARILY DISABLED - Enable only when needed for debugging.
+    
+    To enable: Comment out the return statement below and uncomment the streaming code.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "success": False,
+            "error": "Log streaming temporarily disabled. Enable in app.py if needed for debugging.",
+            "note": "This endpoint was auto-called by a client and blocking the server. Close all Postman/browser tabs first."
+        }
+    )
+    
+    # STREAMING CODE (uncomment to enable):
+    # handler = get_streaming_handler()
+    # client_queue = handler.add_client()
+    # if client_queue is None:
+    #     return JSONResponse(
+    #         status_code=429,
+    #         content={"success": False, "error": "Too many log stream connections."}
+    #     )
+    # logger.info("[LOG_STREAM] New client connected")
+    # return StreamingResponse(
+    #     log_stream_generator(client_queue, timeout=300),
+    #     media_type="text/event-stream",
+    #     headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
+    # )
+
+
 
 
 @app.post("/parse/debug")
@@ -173,13 +267,22 @@ async def parse_debug(pdf: UploadFile = File(...)):
 async def parse_statement(pdf: UploadFile = File(...), request: Request = None):
     request_id = generate_request_id()
     start_time = time.time()
+    
+    # Capture filename early
+    filename = pdf.filename or "unknown.pdf"
 
-    logger.info(f"[REQ {request_id}] Incoming request: {pdf.filename}")
+    logger.info(f"[REQ {request_id}] Incoming request: {filename}")
 
     # Step 1: Validate File
     try:
         pdf_bytes = await pdf.read()
         validate_pdf_file(pdf, pdf_bytes)
+        
+        # Get page count from PDF
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page_count = len(doc)
+        doc.close()
     except HTTPException as e:
         logger.error(f"[REQ {request_id}] File validation failed: {e.detail}")
         raise
@@ -312,6 +415,10 @@ async def parse_statement(pdf: UploadFile = File(...), request: Request = None):
 
         # Deterministic metadata (from extractor) to be used as fallback when AI misses fields
         deterministic_meta = extract_metadata(layout_data, table_data)
+        
+        # Add filename and page count to metadata
+        deterministic_meta["filename"] = filename
+        deterministic_meta["page_count"] = page_count
 
         # Apply rate limit: prefer middleware (slowapi) when installed. When
         # slowapi internals are unavailable or incompatible, use a simple
@@ -460,6 +567,8 @@ async def parse_statement(pdf: UploadFile = File(...), request: Request = None):
                 "period_end",
                 "opening_balance",
                 "closing_balance",
+                "filename",
+                "page_count",
             ]
             merged_meta = {}
             for k in metadata_keys:
@@ -560,12 +669,21 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
     async def stream_generator():
         request_id = generate_request_id()
         start_time = time.time()
-        logger.info(f"[REQ {request_id}] Incoming stream request: {pdf.filename}")
+        
+        # Capture filename early
+        filename = pdf.filename or "unknown.pdf"
+        logger.info(f"[REQ {request_id}] Incoming stream request: {filename}")
 
         # Step 1: Validate File
         try:
             pdf_bytes = await pdf.read()
             validate_pdf_file(pdf, pdf_bytes)
+            
+            # Get page count from PDF
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page_count = len(doc)
+            doc.close()
         except HTTPException as e:
             logger.error(f"[REQ {request_id}] File validation failed: {e.detail}")
             yield json.dumps({"error": e.detail}).encode() + b"\n"
@@ -738,6 +856,10 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
             
             # STEP 5: Extract deterministic metadata
             deterministic_meta = extract_metadata(layout_data, table_data)
+            
+            # Add filename and page count to metadata
+            deterministic_meta["filename"] = filename
+            deterministic_meta["page_count"] = page_count
 
             # Normalize results (same logic as /parse endpoint)
             if isinstance(ai_rows, dict) and "clean" in ai_rows:
@@ -746,6 +868,7 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                 metadata_keys = [
                     "account_number", "account_name", "bank_name", "ifsc", "micr",
                     "period_start", "period_end", "opening_balance", "closing_balance",
+                    "filename", "page_count",
                 ]
                 merged_meta = {}
                 for k in metadata_keys:
