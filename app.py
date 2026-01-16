@@ -787,7 +787,9 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                     ocr_queue.put(("error", str(e)))
                 finally:
                     ocr_done.set()
-            
+
+            # Start OCR thread (outside the worker function)
+            if not skip_ocr:
                 ocr_thread = threading.Thread(target=_ocr_worker, daemon=True)
                 ocr_thread.start()
 
@@ -839,6 +841,11 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                                 "error": msg[1],
                                 "latency_ms": round((time.time() - start_time) * 1000, 2)
                             }).encode() + b"\n"
+                    except queue.Empty:
+                        cycle_count += 1
+                        if cycle_count > max_wait_cycles:
+                            logger.warning(f"[REQ {request_id}] OCR timeout after {max_wait_cycles} cycles")
+                            break
             # After OCR polling, ensure `ocr_data` variable is set
             if not skip_ocr:
                 ocr_data = all_ocr_lines
