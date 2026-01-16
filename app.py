@@ -734,13 +734,8 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                 skip_ocr = False
                 logger.info(f"[REQ {request_id}] Layout+table extraction complete")
             
-            # Yield progress update to client
-            yield json.dumps({
-                "status": "extraction_started",
-                "phase": "layout_and_tables",
-                "file_type": "docx" if is_docx else "pdf",
-                "latency_ms": round((time.time() - start_time) * 1000, 2)
-            }).encode() + b"\n"
+            # Log progress (do not stream intermediate progress to client)
+            logger.info(f"[REQ {request_id}] extraction_started file_type={'docx' if is_docx else 'pdf'} latency_ms={round((time.time() - start_time) * 1000, 2)}")
 
             # STEP 2: Start OCR in background thread (will run concurrently) - SKIP for DOCX
             if skip_ocr:
@@ -829,49 +824,29 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                         if msg[0] == "progress":
                             _, page_num, total_pages, total_lines = msg
                             logger.info(f"[REQ {request_id}] OCR progress: page {page_num}/{total_pages}, {total_lines} cumulative lines")
-                            yield json.dumps({
-                                "status": "ocr_progress",
-                                "page": page_num,
-                                "total_pages": total_pages,
-                                "cumulative_ocr_lines": total_lines,
-                                "latency_ms": round((time.time() - start_time) * 1000, 2)
-                            }).encode() + b"\n"
+                            # do not stream OCR progress to client; buffer and continue
                             
                         elif msg[0] == "complete":
                             all_ocr_lines = msg[1]
                             logger.info(f"[REQ {request_id}] OCR complete: {len(all_ocr_lines)} total lines")
-                            yield json.dumps({
-                                "status": "ocr_complete",
-                                "total_ocr_lines": len(all_ocr_lines),
-                                "latency_ms": round((time.time() - start_time) * 1000, 2)
-                            }).encode() + b"\n"
                             break
                             
                         elif msg[0] == "error":
                             logger.error(f"[REQ {request_id}] OCR error: {msg[1]}")
+                            # stream error immediately so client can handle failures
                             yield json.dumps({
                                 "status": "ocr_error",
                                 "error": msg[1],
                                 "latency_ms": round((time.time() - start_time) * 1000, 2)
                             }).encode() + b"\n"
-                            
-                    except queue.Empty:
-                        cycle_count += 1
-                        if cycle_count > max_wait_cycles:
-                            logger.warning(f"[REQ {request_id}] OCR timeout after {max_wait_cycles} cycles")
-                            break
+            # After OCR polling, ensure `ocr_data` variable is set
+            if not skip_ocr:
+                ocr_data = all_ocr_lines
+            else:
+                ocr_data = []
 
-            # STEP 4: Send chunked LLM calls with collected data
-            ocr_data = all_ocr_lines
-            logger.info(f"[REQ {request_id}] Starting chunked LLM extraction with {len(layout_lines)} layout lines, {len(table_data)} table rows, {len(ocr_data)} OCR lines")
-            
-            yield json.dumps({
-                "status": "sending_to_ai",
-                "layout_lines": len(layout_lines),
-                "table_rows": len(table_data),
-                "ocr_lines": len(ocr_data),
-                "latency_ms": round((time.time() - start_time) * 1000, 2)
-            }).encode() + b"\n"
+            # Log AI send event (do not stream intermediate status)
+            logger.info(f"[REQ {request_id}] sending_to_ai layout_lines={len(layout_lines)} table_rows={len(table_data)} ocr_lines={len(ocr_data)} latency_ms={round((time.time() - start_time) * 1000, 2)}")
 
             # Call verifier with complete data (now uses chunked approach)
             ai_rows = verify_and_clean(
