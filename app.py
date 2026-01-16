@@ -679,11 +679,16 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
             pdf_bytes = await pdf.read()
             validate_pdf_file(pdf, pdf_bytes)
             
-            # Get page count from PDF
-            import fitz
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            page_count = len(doc)
-            doc.close()
+            # Check if this is a DOCX file
+            is_docx = filename.lower().endswith(".docx") or (pdf.content_type and "offic" in pdf.content_type)
+            
+            # Get page count from PDF (skip for DOCX)
+            page_count = 1  # default for DOCX
+            if not is_docx:
+                import fitz
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                page_count = len(doc)
+                doc.close()
         except HTTPException as e:
             logger.error(f"[REQ {request_id}] File validation failed: {e.detail}")
             yield json.dumps({"error": e.detail}).encode() + b"\n"
@@ -705,25 +710,46 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
         try:
             # STEP 1: Fast parallel extraction (layout + tables) — non-blocking
             logger.info(f"[REQ {request_id}] Starting parallel layout+table extraction...")
-            executor = ThreadPoolExecutor(max_workers=3)
-            layout_future = executor.submit(extract_layout, pdf_bytes)
-            table_future = executor.submit(extract_tables, pdf_bytes)
             
-            layout_data = layout_future.result(timeout=30)
-            table_data = table_future.result(timeout=30)
-            logger.info(f"[REQ {request_id}] Layout+table extraction complete")
+            # Handle DOCX files separately (no OCR needed)
+            if is_docx:
+                try:
+                    from extract.docx_loader import extract_docx
+                    layout_data, table_data = extract_docx(pdf_bytes)
+                    ocr_data = []  # No OCR needed for DOCX
+                    skip_ocr = True
+                    logger.info(f"[REQ {request_id}] DOCX extraction complete")
+                except Exception as e:
+                    logger.warning(f"[REQ {request_id}] DOCX extraction failed, falling back to PDF pipeline: {e}")
+                    is_docx = False  # Fall back to PDF processing
+                    skip_ocr = False
+            
+            if not is_docx:
+                executor = ThreadPoolExecutor(max_workers=3)
+                layout_future = executor.submit(extract_layout, pdf_bytes)
+                table_future = executor.submit(extract_tables, pdf_bytes)
+                
+                layout_data = layout_future.result(timeout=30)
+                table_data = table_future.result(timeout=30)
+                skip_ocr = False
+                logger.info(f"[REQ {request_id}] Layout+table extraction complete")
             
             # Yield progress update to client
             yield json.dumps({
                 "status": "extraction_started",
                 "phase": "layout_and_tables",
+                "file_type": "docx" if is_docx else "pdf",
                 "latency_ms": round((time.time() - start_time) * 1000, 2)
             }).encode() + b"\n"
 
-            # STEP 2: Start OCR in background thread (will run concurrently)
-            logger.info(f"[REQ {request_id}] Starting OCR extraction in background...")
-            ocr_queue = queue.Queue()
-            ocr_done = threading.Event()
+            # STEP 2: Start OCR in background thread (will run concurrently) - SKIP for DOCX
+            if skip_ocr:
+                logger.info(f"[REQ {request_id}] Skipping OCR for DOCX file")
+                ocr_data = []
+            else:
+                logger.info(f"[REQ {request_id}] Starting OCR extraction in background...")
+                ocr_queue = queue.Queue()
+                ocr_done = threading.Event()
             
             def _ocr_worker():
                 """Run OCR, yielding pages as they complete."""
@@ -767,8 +793,8 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                 finally:
                     ocr_done.set()
             
-            ocr_thread = threading.Thread(target=_ocr_worker, daemon=True)
-            ocr_thread.start()
+                ocr_thread = threading.Thread(target=_ocr_worker, daemon=True)
+                ocr_thread.start()
 
             # STEP 3: Prepare initial payload with layout + tables (don't wait for full OCR)
             def _join_table_rows_for_size(table_rows):
@@ -784,55 +810,56 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
             joined_layout = "\n".join(layout_lines)
             joined_table = "\n".join(_join_table_rows_for_size(table_data))
 
-            # Collect OCR as it arrives from the background thread
+            # Collect OCR as it arrives from the background thread (skip if DOCX)
             all_ocr_lines = []
             all_transactions = []
             llm_calls_made = 0
             
-            # Poll OCR queue: send LLM calls incrementally as OCR accumulates
-            ocr_page_batch = 0
-            max_wait_cycles = 120  # 120 cycles × 0.5s = 60s timeout
-            cycle_count = 0
-            
-            while not ocr_done.is_set() or not ocr_queue.empty():
-                try:
-                    # Non-blocking poll: check queue for updates
-                    msg = ocr_queue.get(timeout=0.5)
-                    
-                    if msg[0] == "progress":
-                        _, page_num, total_pages, total_lines = msg
-                        logger.info(f"[REQ {request_id}] OCR progress: page {page_num}/{total_pages}, {total_lines} cumulative lines")
-                        yield json.dumps({
-                            "status": "ocr_progress",
-                            "page": page_num,
-                            "total_pages": total_pages,
-                            "cumulative_ocr_lines": total_lines,
-                            "latency_ms": round((time.time() - start_time) * 1000, 2)
-                        }).encode() + b"\n"
+            if not skip_ocr:
+                # Poll OCR queue: send LLM calls incrementally as OCR accumulates
+                ocr_page_batch = 0
+                max_wait_cycles = 120  # 120 cycles × 0.5s = 60s timeout
+                cycle_count = 0
+                
+                while not ocr_done.is_set() or not ocr_queue.empty():
+                    try:
+                        # Non-blocking poll: check queue for updates
+                        msg = ocr_queue.get(timeout=0.5)
                         
-                    elif msg[0] == "complete":
-                        all_ocr_lines = msg[1]
-                        logger.info(f"[REQ {request_id}] OCR complete: {len(all_ocr_lines)} total lines")
-                        yield json.dumps({
-                            "status": "ocr_complete",
-                            "total_ocr_lines": len(all_ocr_lines),
-                            "latency_ms": round((time.time() - start_time) * 1000, 2)
-                        }).encode() + b"\n"
-                        break
-                        
-                    elif msg[0] == "error":
-                        logger.error(f"[REQ {request_id}] OCR error: {msg[1]}")
-                        yield json.dumps({
-                            "status": "ocr_error",
-                            "error": msg[1],
-                            "latency_ms": round((time.time() - start_time) * 1000, 2)
-                        }).encode() + b"\n"
-                        
-                except queue.Empty:
-                    cycle_count += 1
-                    if cycle_count > max_wait_cycles:
-                        logger.warning(f"[REQ {request_id}] OCR timeout after {max_wait_cycles} cycles")
-                        break
+                        if msg[0] == "progress":
+                            _, page_num, total_pages, total_lines = msg
+                            logger.info(f"[REQ {request_id}] OCR progress: page {page_num}/{total_pages}, {total_lines} cumulative lines")
+                            yield json.dumps({
+                                "status": "ocr_progress",
+                                "page": page_num,
+                                "total_pages": total_pages,
+                                "cumulative_ocr_lines": total_lines,
+                                "latency_ms": round((time.time() - start_time) * 1000, 2)
+                            }).encode() + b"\n"
+                            
+                        elif msg[0] == "complete":
+                            all_ocr_lines = msg[1]
+                            logger.info(f"[REQ {request_id}] OCR complete: {len(all_ocr_lines)} total lines")
+                            yield json.dumps({
+                                "status": "ocr_complete",
+                                "total_ocr_lines": len(all_ocr_lines),
+                                "latency_ms": round((time.time() - start_time) * 1000, 2)
+                            }).encode() + b"\n"
+                            break
+                            
+                        elif msg[0] == "error":
+                            logger.error(f"[REQ {request_id}] OCR error: {msg[1]}")
+                            yield json.dumps({
+                                "status": "ocr_error",
+                                "error": msg[1],
+                                "latency_ms": round((time.time() - start_time) * 1000, 2)
+                            }).encode() + b"\n"
+                            
+                    except queue.Empty:
+                        cycle_count += 1
+                        if cycle_count > max_wait_cycles:
+                            logger.warning(f"[REQ {request_id}] OCR timeout after {max_wait_cycles} cycles")
+                            break
 
             # STEP 4: Send chunked LLM calls with collected data
             ocr_data = all_ocr_lines
