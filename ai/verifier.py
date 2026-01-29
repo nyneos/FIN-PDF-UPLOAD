@@ -7,7 +7,9 @@ SIMPLIFIED: Single-shot LLM call + local fallback (no multi-agent overhead).
 import json
 import re
 import time
+from utils.token_budget import default_budget as token_budget
 from groq_client import groq_llm
+from utils.prompt_utils import SYSTEM_PROMPT, preprocess_for_llm, estimate_tokens
 from extract.preprocess import flatten_layout
 from logging_config import configure_logging
 from config import config
@@ -15,17 +17,21 @@ from ai.prompt_memory import add_suggestion
 from typing import List
 from json import JSONDecodeError
 import math
+import difflib
 
 logger = configure_logging()
 
 
 def _join_table_rows(table_data) -> List[str]:
 	rows = []
-	for r in table_data:
+	for r in (table_data or []):
+		# Normalize each table row to a string. If row is a sequence, join
+		# cells while coercing None -> "" and stripping whitespace.
 		if isinstance(r, (list, tuple)):
-			rows.append(" | ".join([str(c).strip() for c in r if c is not None]))
+			cells = ["" if c is None else str(c).strip() for c in r]
+			rows.append(" | ".join(cells).strip())
 		else:
-			rows.append(str(r))
+			rows.append("" if r is None else str(r))
 	return rows
 
 
@@ -436,47 +442,107 @@ def _coerce_transaction_schema(rows):
 
 def _split_into_chunks(layout_lines, table_rows, ocr_lines, chunk_size=29000, num_chunks=4, overlap_lines=5):
 	"""
-	Intelligently split extraction data into overlapping chunks to maximize transaction coverage.
-	
-	Strategy:
-	- Distribute table_rows (most transaction-dense) across chunks evenly
-	- Assign sequential OCR lines to each chunk (some overlap for context)
-	- Allow chunks to overlap slightly (10% of chunk_size) to catch transactions at boundaries
-	- Return list of chunk dicts with 'layout', 'table', 'ocr' keys
+	Weighted and dynamic chunking engine.
+
+	Splits layout, table and ocr lines into weighted chunks using character
+	counts and importance weights. Prioritizes table > ocr > layout.
 	"""
+	# weights
+	w_table = 3
+	w_ocr = 2
+	w_layout = 1
+
+	def _join_rows(rows):
+		if not rows:
+			return ""
+		if isinstance(rows, list):
+			out = []
+			for r in rows:
+				if isinstance(r, (list, tuple)):
+					cells = ["" if c is None else str(c).strip() for c in r]
+					out.append(" ".join(cells).strip())
+				else:
+					out.append("" if r is None else str(r))
+			return "\n".join(out)
+		return "" if rows is None else str(rows)
+
+	# estimate payload size (chars)
+	# Safe char counts: coerce None to empty string and non-str to str
+	chars_table = len(_join_rows(table_rows))
+	chars_ocr = sum(len(str(x)) for x in (ocr_lines or []) )
+	chars_layout = sum(len(str(x)) for x in (layout_lines or []))
+	total_chars = chars_table + chars_ocr + chars_layout
+
+	# Determine chunk size and number of chunks from config if available
+	chunk_size_chars = getattr(config, "AI_CHUNK_SIZE_CHARS", chunk_size)
+	num_chunks = max(1, min(getattr(config, "AI_MAX_CHUNKS", num_chunks), int(math.ceil(total_chars / float(chunk_size_chars)))))
+	overlap = int(getattr(config, "AI_CHUNK_OVERLAP_LINES", overlap_lines))
+
+	# If nothing to chunk, return single empty chunk
+	if total_chars == 0:
+		return [{"index": 0, "table": [], "ocr": [], "layout": []}]
+
+	# Build sequences
+	table_seq = list(table_rows or [])
+	ocr_seq = list(ocr_lines or [])
+	layout_seq = list(layout_lines or [])
+
+	# Compute per-chunk (character) budgets as equal share of total_chars
+	budgets = [total_chars / num_chunks for _ in range(num_chunks)]
+
 	chunks = []
-	
-	# Table rows: distribute evenly across chunks
-	table_rows_per_chunk = max(1, len(table_rows) // num_chunks)
-	ocr_lines_per_chunk = max(1, len(ocr_lines) // num_chunks)
-	layout_lines_per_chunk = max(1, len(layout_lines) // num_chunks)
-    
-	# overlap_lines controls how many lines to include before/after chunk boundaries
-	overlap = int(overlap_lines)
-	
+	t_ptr = 0
+	o_ptr = 0
+	l_ptr = 0
+
 	for i in range(num_chunks):
-		start_table = i * table_rows_per_chunk
-		end_table = (i + 1) * table_rows_per_chunk if i < num_chunks - 1 else len(table_rows)
-		
-		# Add slight overlap to next chunk's start
+		budget = budgets[i]
+		chunk_table = []
+		chunk_ocr = []
+		chunk_layout = []
+
+		# prefer table rows first
+		while t_ptr < len(table_seq) and sum(len(str(x)) for x in chunk_table) < budget:
+			chunk_table.append(table_seq[t_ptr])
+			t_ptr += 1
+
+		# then ocr lines
+		while o_ptr < len(ocr_seq) and (sum(len(str(x)) for x in chunk_table) + sum(len(x) for x in chunk_ocr)) < budget * 1.2:
+			chunk_ocr.append(ocr_seq[o_ptr])
+			o_ptr += 1
+
+		# finally layout lines to fill remaining budget
+		while l_ptr < len(layout_seq) and (sum(len(str(x)) for x in chunk_table) + sum(len(x) for x in chunk_ocr) + sum(len(x) for x in chunk_layout)) < budget * 1.2:
+			chunk_layout.append(layout_seq[l_ptr])
+			l_ptr += 1
+
+		# If this is not the last chunk, add overlap by peeking ahead
 		if i < num_chunks - 1:
-			end_table = min(end_table + overlap, len(table_rows))
-        
-		start_ocr = max(0, i * ocr_lines_per_chunk - overlap)
-		end_ocr = (i + 1) * ocr_lines_per_chunk + overlap if i < num_chunks - 1 else len(ocr_lines)
-        
-		start_layout = max(0, i * layout_lines_per_chunk - overlap)
-		end_layout = (i + 1) * layout_lines_per_chunk + overlap if i < num_chunks - 1 else len(layout_lines)
-		
-		chunk = {
+			if t_ptr < len(table_seq):
+				end = min(len(table_seq), t_ptr + overlap)
+				chunk_table.extend(table_seq[t_ptr:end])
+			if o_ptr < len(ocr_seq):
+				end = min(len(ocr_seq), o_ptr + overlap)
+				chunk_ocr.extend(ocr_seq[o_ptr:end])
+			if l_ptr < len(layout_seq):
+				end = min(len(layout_seq), l_ptr + overlap)
+				chunk_layout.extend(layout_seq[l_ptr:end])
+
+		chunks.append({
 			"index": i,
-			"table": table_rows[start_table:end_table],
-			"ocr": ocr_lines[start_ocr:end_ocr],
-			"layout": layout_lines[start_layout:end_layout],
-		}
-		chunks.append(chunk)
-	
-	logger.info(f"[AI] Split data into {len(chunks)} chunks (avg {chunk_size} chars each)")
+			"table": chunk_table,
+			"ocr": chunk_ocr,
+			"layout": chunk_layout,
+		})
+
+	# Append any remaining items to the last chunk
+	if t_ptr < len(table_seq) or o_ptr < len(ocr_seq) or l_ptr < len(layout_seq):
+		last = chunks[-1]
+		last["table"].extend(table_seq[t_ptr:])
+		last["ocr"].extend(ocr_seq[o_ptr:])
+		last["layout"].extend(layout_seq[l_ptr:])
+
+	logger.info(f"[AI] Split data into {len(chunks)} chunks (avg {chunk_size_chars} chars each)")
 	return chunks
 
 
@@ -498,14 +564,25 @@ def _deduplicate_transactions(all_transactions):
 	seen = {}
 	unique = []
 	
+	def _normalize_narr(n: str):
+		if not n:
+			return ""
+		s = str(n).strip().lower()
+		# remove punctuation, keep spaces and alphanumerics
+		s = re.sub(r"[^a-z0-9\s]", " ", s)
+		# collapse whitespace
+		s = re.sub(r"\s+", " ", s).strip()
+		return s
+
 	for txn in all_transactions:
 		# Skip transactions missing critical date field
 		if not txn.get("tran_date"):
 			unique.append(txn)
 			continue
 		
-		# Build composite key with FULL narration and balance (no truncation)
-		narration = str(txn.get("narration") or "").strip().lower()
+		# Build composite key with FULL normalized narration and balance (no truncation)
+		narration_raw = txn.get("narration") or ""
+		narration = _normalize_narr(narration_raw)
 		amt = txn.get("deposit") or txn.get("withdrawal") or 0
 		try:
 			amt_rounded = round(float(amt), 2) if amt else 0.0
@@ -524,8 +601,45 @@ def _deduplicate_transactions(all_transactions):
 		key = (txn.get("tran_date"), narration, amt_rounded, bal_rounded)
 		
 		if key not in seen:
-			seen[key] = txn
-			unique.append(txn)
+			# Before accepting as unique, check for fuzzy duplicates among seen
+			# If another seen transaction has same date and amount and very
+			# similar narration, treat as duplicate (chunk overlap variants).
+			matched = False
+			for sk, sval in list(seen.items()):
+				try:
+					sk_date, sk_narr, sk_amt, sk_bal = sk
+					if sk_date == txn.get("tran_date") and sk_amt == amt_rounded and sk_amt != 0:
+						# compare normalized narrations
+						ratio = difflib.SequenceMatcher(None, sk_narr, narration).ratio()
+						if ratio >= 0.9:
+							# Consider duplicate: keep the more complete entry
+							prev = seen[sk]
+							def _score(t):
+								s = 0
+								if t.get("balance") is not None:
+									s += 3
+								if t.get("withdrawal") is not None:
+									s += 2
+								if t.get("deposit") is not None:
+									s += 2
+								if t.get("narration") and len(str(t.get("narration")).strip()) > 10:
+									s += 1
+								return s
+							prev_score = _score(prev)
+							curr_score = _score(txn)
+							if curr_score > prev_score:
+								idx = unique.index(prev) if prev in unique else None
+								if idx is not None:
+									unique[idx] = txn
+								seen[sk] = txn
+							matched = True
+							logger.debug(f"[AI] Fuzzy-dup matched (ratio={ratio:.2f}) for date={sk_date} amt={sk_amt}")
+							break
+				except Exception:
+					continue
+			if not matched:
+				seen[key] = txn
+				unique.append(txn)
 		else:
 			# True duplicate (from chunk overlap): keep the more complete entry
 			prev = seen[key]
@@ -547,10 +661,10 @@ def _deduplicate_transactions(all_transactions):
 			curr_score = _score(txn)
 			
 			if curr_score > prev_score:
-				# Replace with better entry
-				idx = unique.index(prev)
-				unique[idx] = txn
-				seen[key] = txn
+					# Replace with better entry
+					idx = unique.index(prev)
+					unique[idx] = txn
+					seen[key] = txn
 	
 	logger.info(f"[AI] Deduplicated {len(all_transactions)} transactions to {len(unique)} unique entries")
 	return unique
@@ -676,17 +790,56 @@ def verify_and_clean(layout_data, table_data, ocr_data):
 	table_rows = table_data
 	ocr_lines = ocr_data or []
 
-	# Build complete payload to check size (NO TRUNCATION - use all data)
-	parts = []
-	if table_rows:
-		parts.append("=== TABLE ===\n" + "\n".join(_join_table_rows(table_rows)))
-	if layout_lines:
-		parts.append("=== LAYOUT ===\n" + "\n".join(layout_lines))
-	if ocr_lines:
-		parts.append("=== OCR ===\n" + "\n".join(ocr_lines))
-	
-	payload = "\n".join(parts)
+	# Sanitize noisy header/footer lines that commonly pollute layout/ocr
+	# (e.g. repeated single-word 'Transaction', 'Transactions', 'Date', 'Page 1 of 4').
+	# Removing these prevents the LLM or fallback parser from treating them
+	# as transaction narrations.
+	def _clean_noise_lines(lines):
+		if not lines:
+			return []
+		out = []
+		noise_re = re.compile(r"^(?:page\s*\d+\s*of\s*\d+|page\s*\d+|transaction(?:s)?|date|amount\s+subtracted|amount\s+added|opening\s+balance|closing\s+balance)$", re.I)
+		for ln in lines:
+			if not ln:
+				continue
+			s = str(ln).strip()
+			# drop lines that are exact noise or are extremely short and entirely non-alphanumeric
+			if noise_re.match(s):
+				continue
+			# ignore obvious page markers
+			if re.match(r"^\s*page\s*\d+", s, re.I):
+				continue
+			# drop lines that are only punctuation or single-character noise
+			if len(s) <= 2 and not re.search(r"[A-Za-z0-9]", s):
+				continue
+			out.append(s)
+		return out
+
+	# apply sanitization to both layout and ocr before further processing
+	try:
+		layout_lines = _clean_noise_lines(layout_lines)
+		ocr_lines = _clean_noise_lines(ocr_lines)
+	except Exception:
+		# defensive: if anything goes wrong, fall back to originals
+		pass
+
+	# Build compact payload for LLM using preprocessing to reduce tokens
+	# Keep the original layout/table/ocr structures but compute a compact text
+	# for the LLM to process while preserving transaction lines.
+	page_texts = []
+	# if layout_lines contains page separators or known page blocks, a caller
+	# could provide page-level texts; here we leave page_texts empty for now
+	payload_text = preprocess_for_llm(
+		layout_text="\n".join(["" if x is None else str(x) for x in layout_lines]),
+		table_text="\n".join(_join_table_rows(table_rows)),
+		ocr_text="\n".join(["" if x is None else str(x) for x in ocr_lines]),
+		page_texts=page_texts,
+	)
+
+	payload = payload_text
 	total_chars = len(payload)
+	estimated_tokens = estimate_tokens(total_chars) + 200  # reserve for system+response
+	logger.info(f"[AI] Compact payload {total_chars} chars (~{estimated_tokens} tokens estimated)")
 
 	# Log per-section sizes for diagnostics
 	chars_table = sum(len(x) for x in _join_table_rows(table_rows))
@@ -703,18 +856,10 @@ def verify_and_clean(layout_data, table_data, ocr_data):
 		logger.debug("[AI] Failed to log AI config values")
 
 	# Format as ChatCompletion messages array (not string)
+	# Build compact messages with a minimal system prompt and concise user prompt
 	messages = [
-		{
-			"role": "user",
-			"content": f"""Extract bank transactions from the following statement data.
-
-Return a JSON array of transactions with this structure:
-[{{"tran_date": "YYYY-MM-DD", "narration": "...", "withdrawal": 0.0, "deposit": 0.0, "balance": 0.0}}]
-
-Only include fields that have data. Dates must be ISO format.
-
-{payload}"""
-		}
+		{"role": "system", "content": SYSTEM_PROMPT},
+		{"role": "user", "content": f"Extract transactions from this statement data.\n\n{payload}"},
 	]
 
 	# Decide: single call (small payload) vs chunked (large payload)
@@ -797,7 +942,11 @@ Only include fields that have data. Dates must be ISO format.
 			# Apply delay before chunk (except first chunk)
 			if idx > 0 and chunk_delay > 0:
 				logger.info(f"[AI] Waiting {chunk_delay}s before chunk {idx+1}/{len(chunks)} to manage TPM...")
-				time.sleep(chunk_delay)
+				try:
+					token_budget.smart_sleep(chunk_delay)
+				except Exception:
+					# fallback to plain sleep if token budget unavailable
+					time.sleep(chunk_delay)
 			llm_calls += 1
 			res = _send_chunk_to_llm(ch, idx, len(chunks))
 			# res: {"transactions": [...], "metadata": {...}}
@@ -809,7 +958,6 @@ Only include fields that have data. Dates must be ISO format.
 					all_txns.extend(txs)
 				if meta:
 					collected_meta.append(meta)
-
 		# Deduplicate transactions across chunks
 		unique_txns = _deduplicate_transactions(all_txns)
 

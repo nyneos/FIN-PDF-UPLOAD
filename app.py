@@ -3,7 +3,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 import time
-from concurrent.futures import ThreadPoolExecutor
 import threading
 import json
 import queue
@@ -15,6 +14,7 @@ from utils.common import generate_request_id
 from utils.token_tracker import get_usage_stats, record_tokens, reset_tracker
 from utils.log_streamer import get_streaming_handler, log_stream_generator
 import re
+import asyncio
 
 
 logger = configure_logging(config.LOG_LEVEL)
@@ -370,29 +370,23 @@ async def parse_statement(pdf: UploadFile = File(...), request: Request = None):
                     out.append(str(r))
             return out
 
-        # Run layout and table extraction in parallel (fast, deterministic)
-        executor = ThreadPoolExecutor(max_workers=3)
-        layout_future = executor.submit(extract_layout, pdf_bytes)
-        table_future = executor.submit(extract_tables, pdf_bytes)
-        
-        # Wait for both to complete
-        layout_data = layout_future.result(timeout=30)
-        table_data = table_future.result(timeout=30)
+        # Run layout and table extraction in background threads without blocking loop
+        extract_timeout = getattr(config, "EXTRACT_TIMEOUT_SECONDS", 30)
+        layout_data = await asyncio.to_thread(extract_layout, pdf_bytes)
+        table_data = await asyncio.to_thread(extract_tables, pdf_bytes)
         
         # Decide whether to run OCR based on layout/table results
         # Run OCR when no layout/table OR when table exists but looks malformed
         if not (layout_data or table_data):
-            logger.info(f"[REQ {request_id}] No layout/table found, running OCR in parallel...")
-            ocr_future = executor.submit(extract_ocr, pdf_bytes)
-            ocr_data = ocr_future.result(timeout=60)
+            logger.info(f"[REQ {request_id}] No layout/table found, running OCR...")
+            ocr_timeout = getattr(config, "OCR_TIMEOUT_SECONDS", 60)
+            ocr_data = await asyncio.to_thread(extract_ocr, pdf_bytes)
         elif table_data and not _table_looks_usable(table_data):
-            logger.info(f"[REQ {request_id}] Table looks malformed, running OCR in parallel...")
-            ocr_future = executor.submit(extract_ocr, pdf_bytes)
-            ocr_data = ocr_future.result(timeout=60)
+            logger.info(f"[REQ {request_id}] Table looks malformed, running OCR...")
+            ocr_timeout = getattr(config, "OCR_TIMEOUT_SECONDS", 60)
+            ocr_data = await asyncio.to_thread(extract_ocr, pdf_bytes)
         else:
             ocr_data = []
-        
-        executor.shutdown(wait=False)
 
         # Quick assembled payload size check to avoid sending very large prompts
         layout_lines_for_size = flatten_layout(layout_data)
@@ -504,14 +498,13 @@ async def parse_statement(pdf: UploadFile = File(...), request: Request = None):
             if force_ocr and not ocr_data:
                 logger.info(f"[REQ {request_id}] force_ocr requested; running OCR")
                 try:
-                    ocr_data = extract_ocr(pdf_bytes)
+                    ocr_data = await asyncio.to_thread(extract_ocr, pdf_bytes)
                 except Exception:
                     logger.exception("[REQ %s] OCR failed during force_ocr" % request_id)
 
             # Primary AI normalization call
-            ai_rows = verify_and_clean(
-                layout_data=layout_data, table_data=table_data, ocr_data=ocr_data
-            )
+            # Run the synchronous verifier in a background thread to avoid blocking the event loop
+            ai_rows = await asyncio.to_thread(verify_and_clean, layout_data, table_data, ocr_data)
 
             # If AI returned no transactions and we haven't run OCR (or OCR was empty),
             # try a one-time OCR retry and re-run the verifier. This helps when
@@ -533,12 +526,10 @@ async def parse_statement(pdf: UploadFile = File(...), request: Request = None):
                 if not _has_transactions(ai_rows) and not ocr_data:
                     logger.info(f"[REQ {request_id}] AI returned no transactions — running one-time OCR retry and re-invoking verifier")
                     try:
-                        ocr_retry = extract_ocr(pdf_bytes)
+                        ocr_retry = await asyncio.to_thread(extract_ocr, pdf_bytes)
                         if ocr_retry:
                             ocr_data = ocr_retry
-                            ai_rows_retry = verify_and_clean(
-                                layout_data=layout_data, table_data=table_data, ocr_data=ocr_data
-                            )
+                            ai_rows_retry = await asyncio.to_thread(verify_and_clean, layout_data, table_data, ocr_data)
                             # prefer the retry result when it contains transactions
                             if _has_transactions(ai_rows_retry):
                                 ai_rows = ai_rows_retry
@@ -725,12 +716,9 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                     skip_ocr = False
             
             if not is_docx:
-                executor = ThreadPoolExecutor(max_workers=3)
-                layout_future = executor.submit(extract_layout, pdf_bytes)
-                table_future = executor.submit(extract_tables, pdf_bytes)
-                
-                layout_data = layout_future.result(timeout=30)
-                table_data = table_future.result(timeout=30)
+                # Run fast extractors off the event loop
+                layout_data = await asyncio.to_thread(extract_layout, pdf_bytes)
+                table_data = await asyncio.to_thread(extract_tables, pdf_bytes)
                 skip_ocr = False
                 logger.info(f"[REQ {request_id}] Layout+table extraction complete")
             
@@ -815,13 +803,15 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
             if not skip_ocr:
                 # Poll OCR queue: send LLM calls incrementally as OCR accumulates
                 ocr_page_batch = 0
-                max_wait_cycles = 120  # 120 cycles × 0.5s = 60s timeout
+                poll_interval = getattr(config, "OCR_POLL_INTERVAL_SECONDS", 0.5)
+                ocr_timeout = getattr(config, "OCR_TIMEOUT_SECONDS", 60)
+                max_wait_cycles = int(max(1, ocr_timeout / float(poll_interval)))
                 cycle_count = 0
                 
                 while not ocr_done.is_set() or not ocr_queue.empty():
                     try:
                         # Non-blocking poll: check queue for updates
-                        msg = ocr_queue.get(timeout=0.5)
+                        msg = ocr_queue.get(timeout=poll_interval)
                         
                         if msg[0] == "progress":
                             _, page_num, total_pages, total_lines = msg
@@ -844,7 +834,7 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                     except queue.Empty:
                         cycle_count += 1
                         if cycle_count > max_wait_cycles:
-                            logger.warning(f"[REQ {request_id}] OCR timeout after {max_wait_cycles} cycles")
+                            logger.warning(f"[REQ {request_id}] OCR timeout after {max_wait_cycles} cycles ({ocr_timeout}s)")
                             break
             # After OCR polling, ensure `ocr_data` variable is set
             if not skip_ocr:
@@ -855,10 +845,9 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
             # Log AI send event (do not stream intermediate status)
             logger.info(f"[REQ {request_id}] sending_to_ai layout_lines={len(layout_lines)} table_rows={len(table_data)} ocr_lines={len(ocr_data)} latency_ms={round((time.time() - start_time) * 1000, 2)}")
 
-            # Call verifier with complete data (now uses chunked approach)
-            ai_rows = verify_and_clean(
-                layout_data=layout_data, table_data=table_data, ocr_data=ocr_data
-            )
+            # Call verifier with complete data (now uses chunked approach).
+            # Run verifier off the event loop so it doesn't block the streamer.
+            ai_rows = await asyncio.to_thread(verify_and_clean, layout_data, table_data, ocr_data)
             llm_calls_made = ai_rows.get("debug", {}).get("num_llm_calls", 1)
             
             logger.info(f"[REQ {request_id}] AI chunked extraction complete ({llm_calls_made} LLM calls), processing results...")

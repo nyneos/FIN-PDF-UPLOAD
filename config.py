@@ -63,6 +63,10 @@ class Config:
     # Optional: expected tokens-per-minute limit for Groq/API key. If set, the client
     # will estimate tokens and avoid calls that clearly exceed this limit.
     GROQ_TPM_LIMIT: int = int(os.getenv("GROQ_TPM_LIMIT", "0"))  # 0 disables pre-check
+    # Optional per-key overrides: allow specifying a per-key TPM and daily limit
+    # These are used by the client helper that constructs per-key TokenBudget instances.
+    GROQ_KEY_TPM: int = int(os.getenv("GROQ_KEY_TPM", "0"))
+    GROQ_KEY_DAILY: int = int(os.getenv("GROQ_KEY_DAILY", "0"))
     
     # Delay between chunks (in seconds) to spread TPM usage and avoid bursting rate limits.
     # Recommended: 10-15 seconds for 30k TPM models when chunks are ~3k tokens each.
