@@ -36,8 +36,9 @@ def preprocess_image(img):
 def extract_ocr(pdf_bytes: bytes):
     rows = []
     try:
-        pages = pdf2image.convert_from_bytes(pdf_bytes, dpi=300)
-        logger.info(f"[OCR] {len(pages)} pages to OCR")
+        dpi = getattr(config, "PADDLE_OCR_DPI", 300)
+        pages = pdf2image.convert_from_bytes(pdf_bytes, dpi=dpi)
+        logger.info(f"[OCR] {len(pages)} pages to OCR (dpi={dpi})")
 
         for idx, img in enumerate(pages[: config.OCR_MAX_PAGES]):
             clean = preprocess_image(img)

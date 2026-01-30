@@ -379,11 +379,11 @@ async def parse_statement(pdf: UploadFile = File(...), request: Request = None):
         # Run OCR when no layout/table OR when table exists but looks malformed
         if not (layout_data or table_data):
             logger.info(f"[REQ {request_id}] No layout/table found, running OCR...")
-            ocr_timeout = getattr(config, "OCR_TIMEOUT_SECONDS", 60)
+            ocr_timeout = getattr(config, "OCR_TIMEOUT_SECONDS", 20)
             ocr_data = await asyncio.to_thread(extract_ocr, pdf_bytes)
         elif table_data and not _table_looks_usable(table_data):
             logger.info(f"[REQ {request_id}] Table looks malformed, running OCR...")
-            ocr_timeout = getattr(config, "OCR_TIMEOUT_SECONDS", 60)
+            ocr_timeout = getattr(config, "OCR_TIMEOUT_SECONDS", 20)
             ocr_data = await asyncio.to_thread(extract_ocr, pdf_bytes)
         else:
             ocr_data = []
@@ -659,7 +659,7 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
     """
     async def stream_generator():
         request_id = generate_request_id()
-        start_time = time.time()
+        req_start_time = time.time()
         
         # Capture filename early
         filename = pdf.filename or "unknown.pdf"
@@ -721,11 +721,47 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                 table_data = await asyncio.to_thread(extract_tables, pdf_bytes)
                 skip_ocr = False
                 logger.info(f"[REQ {request_id}] Layout+table extraction complete")
+
+            # Helper: decide whether table_data looks usable (same logic as non-stream path)
+            def _table_looks_usable(table_rows):
+                if not table_rows:
+                    return False
+                num_re = re.compile(r"\d[\d,]*\.?\d{0,2}")
+                right_numeric_positions = []
+                row_count = 0
+                for r in table_rows:
+                    row_count += 1
+                    cells = r if isinstance(r, (list, tuple)) else [r]
+                    cells = ["" if c is None else str(c).strip() for c in cells]
+                    pos = None
+                    for i in range(len(cells) - 1, -1, -1):
+                        if num_re.search(cells[i]):
+                            pos = i
+                            break
+                    if pos is not None:
+                        right_numeric_positions.append(pos)
+
+                if not right_numeric_positions:
+                    return False
+
+                from collections import Counter
+                ctr = Counter(right_numeric_positions)
+                most_common_pos, freq = ctr.most_common(1)[0]
+                if freq < max(2, int(0.5 * len(right_numeric_positions))):
+                    return False
+                if row_count < 3:
+                    return False
+                return True
             
             # Log progress (do not stream intermediate progress to client)
-            logger.info(f"[REQ {request_id}] extraction_started file_type={'docx' if is_docx else 'pdf'} latency_ms={round((time.time() - start_time) * 1000, 2)}")
+                logger.info(f"[REQ {request_id}] extraction_started file_type={'docx' if is_docx else 'pdf'} latency_ms={round((time.time() - req_start_time) * 1000, 2)}")
 
             # STEP 2: Start OCR in background thread (will run concurrently) - SKIP for DOCX
+            # If table extraction looks clean/usable, skip OCR to save CPU/time
+            if not skip_ocr and table_data and _table_looks_usable(table_data):
+                logger.info(f"[REQ {request_id}] Table looks usable — skipping OCR to save CPU")
+                skip_ocr = True
+
             if skip_ocr:
                 logger.info(f"[REQ {request_id}] Skipping OCR for DOCX file")
                 ocr_data = []
@@ -735,41 +771,14 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                 ocr_done = threading.Event()
             
             def _ocr_worker():
-                """Run OCR, yielding pages as they complete."""
+                """Run OCR using the centralized extractor to respect config and avoid duplicate stacks."""
                 try:
-                    # We'll collect OCR progressively and notify queue
-                    import pdf2image
-                    import pytesseract
-                    import numpy as np
-                    import cv2
-                    
-                    pages = pdf2image.convert_from_bytes(pdf_bytes, dpi=300)
-                    logger.info(f"[OCR_WORKER] {len(pages)} pages to OCR")
-                    
-                    def preprocess_image(img):
-                        gray = cv2.cvtColor(np.array(img), cv2.COLOR_BGR2GRAY)
-                        gray = cv2.bilateralFilter(gray, 9, 75, 75)
-                        thresh = cv2.adaptiveThreshold(
-                            gray, 255,
-                            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                            cv2.THRESH_BINARY,
-                            31, 2
-                        )
-                        return thresh
-                    
-                    all_ocr_lines = []
-                    for idx, img in enumerate(pages):
-                        clean = preprocess_image(img)
-                        text = pytesseract.image_to_string(clean)
-                        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-                        all_ocr_lines.extend(lines)
-                        logger.info(f"[OCR_WORKER] Page {idx+1}/{len(pages)}: {len(lines)} lines (cumulative: {len(all_ocr_lines)})")
-                        
-                        # Send batch update every 5 pages or on final page
-                        if (idx + 1) % 5 == 0 or (idx + 1) == len(pages):
-                            ocr_queue.put(("progress", idx + 1, len(pages), len(all_ocr_lines)))
-                    
-                    ocr_queue.put(("complete", all_ocr_lines))
+                    # Delegate to the shared extractor which respects env/config
+                    lines = extract_ocr(pdf_bytes)
+                    if lines:
+                        # publish as a single batch (extract_ocr currently returns full text)
+                        ocr_queue.put(("batch", lines))
+                    ocr_queue.put(("complete", lines))
                 except Exception as e:
                     logger.exception(f"[OCR_WORKER] Error: {e}")
                     ocr_queue.put(("error", str(e)))
@@ -804,38 +813,67 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                 # Poll OCR queue: send LLM calls incrementally as OCR accumulates
                 ocr_page_batch = 0
                 poll_interval = getattr(config, "OCR_POLL_INTERVAL_SECONDS", 0.5)
-                ocr_timeout = getattr(config, "OCR_TIMEOUT_SECONDS", 60)
-                max_wait_cycles = int(max(1, ocr_timeout / float(poll_interval)))
-                cycle_count = 0
-                
+                ocr_timeout = getattr(config, "OCR_TIMEOUT_SECONDS", 20)
+                ocr_start = time.monotonic()
+
                 while not ocr_done.is_set() or not ocr_queue.empty():
+                    # If client disconnected, stop waiting to avoid leaking CPU/wait
+                    try:
+                        if request and await request.is_disconnected():
+                            logger.warning(f"[REQ {request_id}] client disconnected, stopping OCR polling")
+                            break
+                    except Exception:
+                        # best effort; do not fail on disconnect check
+                        pass
                     try:
                         # Non-blocking poll: check queue for updates
                         msg = ocr_queue.get(timeout=poll_interval)
-                        
-                        if msg[0] == "progress":
+
+                        if msg[0] == "batch":
+                            # incremental OCR lines
+                            _, new_lines = msg
+                            all_ocr_lines.extend(new_lines)
+                            logger.info(f"[REQ {request_id}] OCR batch received: {len(new_lines)} new lines (cumulative: {len(all_ocr_lines)})")
+
+                        elif msg[0] == "progress":
                             _, page_num, total_pages, total_lines = msg
                             logger.info(f"[REQ {request_id}] OCR progress: page {page_num}/{total_pages}, {total_lines} cumulative lines")
                             # do not stream OCR progress to client; buffer and continue
-                            
+
                         elif msg[0] == "complete":
                             all_ocr_lines = msg[1]
                             logger.info(f"[REQ {request_id}] OCR complete: {len(all_ocr_lines)} total lines")
                             break
-                            
+
                         elif msg[0] == "error":
                             logger.error(f"[REQ {request_id}] OCR error: {msg[1]}")
                             # stream error immediately so client can handle failures
                             yield json.dumps({
                                 "status": "ocr_error",
                                 "error": msg[1],
-                                "latency_ms": round((time.time() - start_time) * 1000, 2)
+                                "latency_ms": round((time.time() - req_start_time) * 1000, 2)
                             }).encode() + b"\n"
                     except queue.Empty:
-                        cycle_count += 1
-                        if cycle_count > max_wait_cycles:
-                            logger.warning(f"[REQ {request_id}] OCR timeout after {max_wait_cycles} cycles ({ocr_timeout}s)")
+                        # timeout check using wall-clock (robust against thread scheduling variability)
+                        if time.monotonic() - ocr_start > ocr_timeout:
+                            logger.warning(f"[REQ {request_id}] OCR timeout after {ocr_timeout}s (wall-clock)")
                             break
+
+                # Drain any remaining messages so we capture partial results produced
+                try:
+                    while True:
+                        msg = ocr_queue.get_nowait()
+                        if msg[0] == "batch":
+                            all_ocr_lines.extend(msg[1])
+                        elif msg[0] == "complete":
+                            all_ocr_lines = msg[1]
+                            logger.info(f"[REQ {request_id}] OCR completed during drain: {len(all_ocr_lines)} lines")
+                        elif msg[0] == "progress":
+                            logger.info(f"[REQ {request_id}] OCR progress (drain): page {msg[1]}/{msg[2]}, {msg[3]} cumulative lines")
+                        elif msg[0] == "error":
+                            logger.error(f"[REQ {request_id}] OCR error during drain: {msg[1]}")
+                except queue.Empty:
+                    pass
             # After OCR polling, ensure `ocr_data` variable is set
             if not skip_ocr:
                 ocr_data = all_ocr_lines
