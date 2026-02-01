@@ -680,6 +680,58 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                 page_count = len(doc)
                 doc.close()
+
+            # --- Stream access key validation ---
+            # The stream endpoint is gated by a simple shared secret (a "key").
+            # Accept header `x-stream-key` or query param `stream_key` (or `token`).
+            # Allowed keys come from `config.STREAM_ACCESS_KEYS` (comma-separated).
+            # For backward compatibility, we also accept `config.STREAM_API_TOKENS`
+            # or fall back to `config.GROQ_API_KEY` when needed.
+            stream_key = None
+            try:
+                if request and getattr(request, "headers", None):
+                    stream_key = request.headers.get("x-stream-key") or request.headers.get("x-api-key")
+                if not stream_key and request and getattr(request, "query_params", None):
+                    stream_key = request.query_params.get("stream_key") or request.query_params.get("token")
+            except Exception:
+                stream_key = None
+
+            allowed_keys = []
+            # Primary: STREAM_ACCESS_KEYS (new preferred variable)
+            raw = getattr(config, "STREAM_ACCESS_KEYS", None)
+            if raw:
+                try:
+                    allowed_keys = [t.strip() for t in str(raw).split(",") if t.strip()]
+                except Exception:
+                    allowed_keys = []
+            else:
+                # Backward compatibility: support STREAM_API_TOKENS
+                raw2 = getattr(config, "STREAM_API_TOKENS", None)
+                if raw2:
+                    try:
+                        allowed_keys = [t.strip() for t in str(raw2).split(",") if t.strip()]
+                    except Exception:
+                        allowed_keys = []
+                elif getattr(config, "GROQ_API_KEY", None):
+                    allowed_keys = [config.GROQ_API_KEY]
+
+            # If no allowed keys are configured, reject the stream request
+            if not allowed_keys:
+                logger.warning(f"[REQ {request_id}] stream access keys not configured; rejecting stream requests")
+                yield json.dumps({
+                    "status": "error",
+                    "error": "integration failed, please renew the subscription",
+                    "detail": "stream access key not configured on server"
+                }).encode() + b"\n"
+                return
+
+            if not stream_key or stream_key not in allowed_keys:
+                logger.warning(f"[REQ {request_id}] Stream access key missing/invalid")
+                yield json.dumps({
+                    "status": "error",
+                    "error": "integration failed, please renew the subscription"
+                }).encode() + b"\n"
+                return
         except HTTPException as e:
             logger.error(f"[REQ {request_id}] File validation failed: {e.detail}")
             yield json.dumps({"error": e.detail}).encode() + b"\n"
@@ -881,7 +933,7 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                 ocr_data = []
 
             # Log AI send event (do not stream intermediate status)
-            logger.info(f"[REQ {request_id}] sending_to_ai layout_lines={len(layout_lines)} table_rows={len(table_data)} ocr_lines={len(ocr_data)} latency_ms={round((time.time() - start_time) * 1000, 2)}")
+            logger.info(f"[REQ {request_id}] sending_to_ai layout_lines={len(layout_lines)} table_rows={len(table_data)} ocr_lines={len(ocr_data)} latency_ms={round((time.time() - req_start_time) * 1000, 2)}")
 
             # Call verifier with complete data (now uses chunked approach).
             # Run verifier off the event loop so it doesn't block the streamer.
@@ -937,7 +989,7 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
 
             validation = validate_running_balance(transactions, opening_balance)
 
-            latency = round((time.time() - start_time) * 1000, 2)
+            latency = round((time.time() - req_start_time) * 1000, 2)
             logger.info(f"[REQ {request_id}] Completed stream parse in {latency}ms with {len(transactions)} transactions")
 
             # STEP 6: Yield final result
@@ -982,7 +1034,7 @@ async def parse_statement_stream(pdf: UploadFile = File(...), request: Request =
                 "status": "error",
                 "error": str(e),
                 "request_id": request_id,
-                "latency_ms": round((time.time() - start_time) * 1000, 2)
+                "latency_ms": round((time.time() - req_start_time) * 1000, 2)
             }).encode() + b"\n"
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")

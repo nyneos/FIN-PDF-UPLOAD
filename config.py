@@ -83,6 +83,10 @@ class Config:
 
     # --- Logging ---
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+    # Stream access keys for protected streaming endpoints. Comma-separated
+    # values may be provided via `STREAM_ACCESS_KEYS` environment variable.
+    # These are simple shared secrets to gate the `/parse/stream` endpoint.
+    STREAM_ACCESS_KEYS: str = os.getenv("STREAM_ACCESS_KEYS", "")
 
 
 config = Config()
